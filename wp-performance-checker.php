@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Performance Checker
  * Description: Helps debug slow WordPress actions (like saving posts) by logging timings and query stats.
- * Version: 0.3.0
+ * Version: 0.3.1
  * Author: Ioannis Kokkinis
  * Author URI: https://buy-it.gr
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 // Plugin metadata.
 if (!defined('WPPC_PLUGIN_VERSION')) {
-    define('WPPC_PLUGIN_VERSION', '0.3.0');
+    define('WPPC_PLUGIN_VERSION', '0.3.1');
 }
 
 /**
@@ -22,7 +22,7 @@ if (!defined('WPPC_PLUGIN_VERSION')) {
  * Override this in wp-config.php if your public repo uses a different path.
  */
 if (!defined('WPPC_GITHUB_REPO')) {
-    define('WPPC_GITHUB_REPO', 'ioanniskokkinis/wp-performance-checker');
+    define('WPPC_GITHUB_REPO', 'upggr/wp-performance-checker');
 }
 
 if (!defined('WPPC_PLUGIN_FILE')) {

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Performance Checker
  * Description: Helps debug slow WordPress actions (like saving posts) by logging timings and query stats.
- * Version: 0.3.1
+ * Version: 0.3.2
  * Author: Ioannis Kokkinis
  * Author URI: https://buy-it.gr
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 // Plugin metadata.
 if (!defined('WPPC_PLUGIN_VERSION')) {
-    define('WPPC_PLUGIN_VERSION', '0.3.1');
+    define('WPPC_PLUGIN_VERSION', '0.3.2');
 }
 
 /**
@@ -784,9 +784,11 @@ class WP_Performance_Checker {
     /**
      * Synthetic "save to production" test.
      *
-     * Creates (or reuses) a lightweight test post and measures the time it
-     * takes to perform a real wp_update_post() on this installation, including
-     * all save_post hooks and DB writes.
+     * Creates (or reuses) a lightweight test post cloned from the most recent
+     * published post (if available) and measures the time it takes to perform
+     * a real wp_update_post() on this installation, including all save_post
+     * hooks and DB writes. The test post always stays in draft status and does
+     * not affect the live site.
      *
      * @return array<string,mixed>
      */
@@ -796,13 +798,34 @@ class WP_Performance_Checker {
         $post_id = (int) get_option('wp_performance_checker_test_post_id', 0);
         $post    = $post_id ? get_post($post_id) : null;
 
+        // Find latest published post to clone from, if any.
+        $source_post = null;
+        $sources     = get_posts(
+            [
+                'post_type'      => 'post',
+                'post_status'    => 'publish',
+                'posts_per_page' => 1,
+                'orderby'        => 'date',
+                'order'          => 'DESC',
+                'no_found_rows'  => true,
+                'fields'         => 'all',
+            ]
+        );
+        if (!empty($sources) && $sources[0] instanceof \WP_Post) {
+            $source_post = $sources[0];
+        }
+
+        $base_title   = $source_post ? $source_post->post_title . ' [WPPC test]' : 'WP Performance Checker Test Post';
+        $base_content = $source_post ? $source_post->post_content : 'This is a synthetic test post used only for performance measurements.';
+
         if (!$post instanceof \WP_Post || $post->post_type !== 'post') {
             $post_id = wp_insert_post(
                 [
-                    'post_title'   => 'WP Performance Checker Test Post',
+                    'post_title'   => $base_title,
                     'post_status'  => 'draft',
                     'post_type'    => 'post',
-                    'post_content' => 'This is a synthetic test post used only for performance measurements.',
+                    'post_content' => $base_content,
+                    'post_author'  => $source_post ? $source_post->post_author : get_current_user_id(),
                 ],
                 true
             );
@@ -818,6 +841,19 @@ class WP_Performance_Checker {
             }
 
             update_option('wp_performance_checker_test_post_id', (int) $post_id, false);
+        } else {
+            // Ensure existing test post stays draft and roughly matches the source.
+            $update_args = [
+                'ID'          => (int) $post->ID,
+                'post_status' => 'draft',
+            ];
+
+            if ($source_post) {
+                $update_args['post_title']   = $base_title;
+                $update_args['post_content'] = $base_content;
+            }
+
+            wp_update_post($update_args);
         }
 
         $start         = microtime(true);

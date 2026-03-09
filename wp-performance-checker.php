@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Performance Checker
  * Description: Helps debug slow WordPress actions (like saving posts) by logging timings and query stats.
- * Version: 0.3.2
+ * Version: 0.3.3
  * Author: Ioannis Kokkinis
  * Author URI: https://buy-it.gr
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 // Plugin metadata.
 if (!defined('WPPC_PLUGIN_VERSION')) {
-    define('WPPC_PLUGIN_VERSION', '0.3.2');
+    define('WPPC_PLUGIN_VERSION', '0.3.3');
 }
 
 /**
@@ -49,6 +49,9 @@ class WP_Performance_Checker {
     /** @var array<string,mixed>|null */
     private $last_save_context = null;
 
+    /** @var int Time from request start until save_post began (ms). */
+    private $time_before_save_ms = 0;
+
     /**
      * Singleton bootstrap.
      */
@@ -77,6 +80,7 @@ class WP_Performance_Checker {
 
         // Global request timer.
         $this->start_timer('request');
+        $this->start_timer('before_save'); // same start; stopped when save_post begins
         add_action('shutdown', [$this, 'log_request_summary'], PHP_INT_MAX);
 
         // Post save timing.
@@ -112,6 +116,8 @@ class WP_Performance_Checker {
         if (wp_is_post_autosave($post_ID) || wp_is_post_revision($post_ID)) {
             return;
         }
+
+        $this->time_before_save_ms = (int) round($this->stop_timer('before_save') * 1000);
 
         $key = "save_post_{$post_ID}";
         $this->start_timer($key);
@@ -169,6 +175,7 @@ class WP_Performance_Checker {
             'status'        => $post->post_status,
             'is_update'     => $update,
             'hook_time_ms'  => $hook_time_ms,
+            'before_save_ms'=> $this->time_before_save_ms,
         ];
     }
 
@@ -190,6 +197,12 @@ class WP_Performance_Checker {
             'method'  => isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : '',
         ];
 
+        if ($script === 'admin-ajax.php') {
+            $context['ajax_action']  = isset($_REQUEST['action']) ? sanitize_key((string) $_REQUEST['action']) : '';
+            $context['request_uri']  = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+            $context['referer']      = isset($_SERVER['HTTP_REFERER']) ? (string) $_SERVER['HTTP_REFERER'] : '';
+        }
+
         // Always log the raw request timing.
         $this->log('request', $context);
 
@@ -203,11 +216,13 @@ class WP_Performance_Checker {
         ) {
             $save_context            = $this->last_save_context;
             $save_context['time_ms'] = $time_ms;
+            $save_context['after_save_ms'] = max(0, $time_ms - (int) ($save_context['before_save_ms'] ?? 0) - (int) ($save_context['hook_time_ms'] ?? 0));
 
             $this->log('save_request', $save_context);
         }
 
         $this->last_save_context = null;
+        $this->time_before_save_ms = 0;
     }
 
     /**
@@ -299,15 +314,19 @@ class WP_Performance_Checker {
     }
 
     /**
-     * Get human-readable log lines for the last N save requests.
+     * Get structured data for the last N save requests.
      *
-     * Each line uses the format:
-     *   "HH:MM dd/mm/YYYY,POST_ID,POST_TITLE,TIME_MS ms"
+     * Each item contains:
+     *  - time (formatted "HH:MM dd/mm/YYYY")
+     *  - post_id
+     *  - post_title
+     *  - total_ms
+     *  - before_ms, hook_ms, after_ms when available
      *
      * @param  int                 $limit
-     * @return array<int,string>
+     * @return array<int,array<string,mixed>>
      */
-    private function get_recent_save_log_lines(int $limit = 20): array {
+    private function get_recent_save_events(int $limit = 20): array {
         if (!file_exists($this->log_file) || !is_readable($this->log_file)) {
             return [];
         }
@@ -342,6 +361,9 @@ class WP_Performance_Checker {
             $post_id    = isset($data['post_id']) ? (int) $data['post_id'] : 0;
             $post_title = isset($data['post_title']) ? (string) $data['post_title'] : '';
             $time_ms    = (int) $data['time_ms'];
+            $before_ms  = isset($data['before_save_ms']) ? (int) $data['before_save_ms'] : null;
+            $hook_ms    = isset($data['hook_time_ms']) ? (int) $data['hook_time_ms'] : null;
+            $after_ms   = isset($data['after_save_ms']) ? (int) $data['after_save_ms'] : null;
 
             $display_time = $timestamp;
             if ($timestamp !== '') {
@@ -354,16 +376,98 @@ class WP_Performance_Checker {
                 }
             }
 
-            $result[] = sprintf(
-                '%s,%d,%s,%d ms',
-                $display_time,
-                $post_id,
-                $post_title,
-                $time_ms
-            );
+            $result[] = [
+                'time'       => $display_time,
+                'post_id'    => $post_id,
+                'post_title' => $post_title,
+                'total_ms'   => $time_ms,
+                'before_ms'  => $before_ms,
+                'hook_ms'    => $hook_ms,
+                'after_ms'   => $after_ms,
+            ];
         }
 
-        return array_reverse($result);
+        return $result;
+    }
+
+    /**
+     * Get recent admin-ajax requests (not just saves).
+     *
+     * Used to see which background Ajax calls are slow after a save.
+     *
+     * @param  int                 $limit
+     * @return array<int,array<string,mixed>>
+     */
+    private function get_recent_ajax_events(int $limit = 20): array {
+        if (!file_exists($this->log_file) || !is_readable($this->log_file)) {
+            return [];
+        }
+
+        $lines = @file($this->log_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if (!is_array($lines) || empty($lines)) {
+            return [];
+        }
+
+        $result = [];
+        $needle = ' request ';
+
+        for ($i = count($lines) - 1; $i >= 0 && count($result) < $limit; $i--) {
+            $line = $lines[$i];
+            $pos  = strpos($line, $needle);
+            if ($pos === false) {
+                continue;
+            }
+
+            // Extract timestamp (first 19 chars within brackets).
+            $timestamp = '';
+            if (strlen($line) > 22 && $line[0] === '[') {
+                $timestamp = substr($line, 1, 19);
+            }
+
+            $json = substr($line, $pos + strlen($needle));
+            $data = json_decode($json, true);
+            if (!is_array($data) || !isset($data['time_ms'])) {
+                continue;
+            }
+
+            if (!isset($data['script']) || $data['script'] !== 'admin-ajax.php') {
+                continue;
+            }
+
+            $time_ms = (int) $data['time_ms'];
+            $time_s  = $time_ms / 1000;
+
+            // Skip very fast or noisy requests (e.g. heartbeat) – we care about slow ones.
+            $ajax_action = isset($data['ajax_action']) ? (string) $data['ajax_action'] : '';
+            if ($time_s <= 0.5 && ($ajax_action === '' || $ajax_action === 'heartbeat')) {
+                continue;
+            }
+
+            $display_time = $timestamp;
+            if ($timestamp !== '') {
+                try {
+                    $dt = new DateTime($timestamp, new DateTimeZone('UTC'));
+                    $display_time = $dt->format('H:i d/m/Y');
+                } catch (Exception $e) {
+                    // Keep raw timestamp.
+                }
+            }
+
+            $request_uri = isset($data['request_uri']) ? (string) $data['request_uri'] : '';
+            $referer     = isset($data['referer']) ? (string) $data['referer'] : '';
+
+            $result[] = [
+                'time'        => $display_time,
+                'method'      => isset($data['method']) ? (string) $data['method'] : '',
+                'action'      => $ajax_action,
+                'request_uri' => $request_uri,
+                'referer'     => $referer,
+                'total_ms'    => $time_ms,
+                'total_s'     => $time_s,
+            ];
+        }
+
+        return $result;
     }
 
     /**
@@ -373,9 +477,16 @@ class WP_Performance_Checker {
      * @param array<string,mixed>  $context
      */
     private function log(string $event, array $context): void {
+        if (function_exists('wp_date')) {
+            $ts = wp_date('Y-m-d H:i:s');
+        } else {
+            // Fallback to server time if wp_date is unavailable.
+            $ts = date('Y-m-d H:i:s');
+        }
+
         $line = sprintf(
             "[%s] %s %s\n",
-            gmdate('Y-m-d H:i:s'),
+            $ts,
             $event,
             wp_json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
         );
@@ -428,7 +539,8 @@ class WP_Performance_Checker {
         $filesize         = $exists ? filesize($log_file) : 0;
         $human_size       = size_format((float) $filesize);
         $save_stats       = $this->get_recent_save_stats(10);
-        $save_log_lines   = $this->get_recent_save_log_lines(20);
+        $save_events      = $this->get_recent_save_events(20);
+        $ajax_events      = $this->get_recent_ajax_events(20);
         $save_enabled     = $this->save_timings_enabled;
 
         $base_url = admin_url('tools.php?page=wp-performance-checker');
@@ -502,15 +614,19 @@ class WP_Performance_Checker {
                 $min_ms     = (int) $save_stats['min_ms'];
                 $max_ms     = (int) $save_stats['max_ms'];
 
+                $average_s = $average_ms / 1000;
+                $min_s     = $min_ms / 1000;
+                $max_s     = $max_ms / 1000;
+
                 echo '<p>';
                 echo esc_html(
                     sprintf(
-                        /* translators: 1: count, 2: average ms, 3: min ms, 4: max ms */
-                        __('Last %1$d saves: average %2$d ms (min %3$d ms, max %4$d ms).', 'wp-performance-checker'),
+                        /* translators: 1: count, 2: average s, 3: min s, 4: max s */
+                        __('Last %1$d saves: average %.2f s (min %.2f s, max %.2f s).', 'wp-performance-checker'),
                         $count,
-                        $average_ms,
-                        $min_ms,
-                        $max_ms
+                        $average_s,
+                        $min_s,
+                        $max_s
                     )
                 );
                 echo '</p>';
@@ -518,16 +634,130 @@ class WP_Performance_Checker {
                 echo '<p>' . esc_html__('No save data logged yet. Edit a post and click Save to start collecting data.', 'wp-performance-checker') . '</p>';
             }
 
-            // Text area with last 20 log entries.
+            // Table with last 20 log entries.
             echo '<h3>' . esc_html__('Latest save log (last 20 entries)', 'wp-performance-checker') . '</h3>';
-            if (!empty($save_log_lines)) {
-                $text = implode("\n", $save_log_lines);
-                echo '<p>' . esc_html__('Each line: time (HH:MM dd/mm/YYYY), post ID, post title, time from save to post (ms).', 'wp-performance-checker') . '</p>';
-                echo '<textarea rows="10" style="width:100%;font-family:monospace;" readonly>';
-                echo esc_textarea($text);
-                echo '</textarea>';
+            if (!empty($save_events)) {
+                echo '<p>' . esc_html__(
+                    'Columns: time (HH:MM dd/mm/YYYY), post ID, title, total seconds. When available, before/hook/after show time until save started, inside save_post, and after save until the response is sent.',
+                    'wp-performance-checker'
+                ) . '</p>';
+
+                echo '<style>
+                    .wppc-row-fast td { background-color: #e6ffed; }
+                    .wppc-row-medium td { background-color: #fff9e6; }
+                    .wppc-row-slow td { background-color: #ffecec; }
+                </style>';
+
+                echo '<table class="widefat striped" style="max-width:100%;margin-top:0.5em;">';
+                echo '<thead><tr>';
+                echo '<th>' . esc_html__('Time', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Post', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Total (s)', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Before (s)', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Hook (s)', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('After (s)', 'wp-performance-checker') . '</th>';
+                echo '</tr></thead><tbody>';
+
+                foreach ($save_events as $event) {
+                    $time      = isset($event['time']) ? (string) $event['time'] : '';
+                    $post_id   = isset($event['post_id']) ? (int) $event['post_id'] : 0;
+                    $title     = isset($event['post_title']) ? (string) $event['post_title'] : '';
+                    $total_ms  = isset($event['total_ms']) ? (int) $event['total_ms'] : 0;
+                    $before_ms = $event['before_ms'] !== null ? (int) $event['before_ms'] : null;
+                    $hook_ms   = $event['hook_ms'] !== null ? (int) $event['hook_ms'] : null;
+                    $after_ms  = $event['after_ms'] !== null ? (int) $event['after_ms'] : null;
+
+                    $total_s  = $total_ms / 1000;
+                    $before_s = $before_ms !== null ? $before_ms / 1000 : null;
+                    $hook_s   = $hook_ms !== null ? $hook_ms / 1000 : null;
+                    $after_s  = $after_ms !== null ? $after_ms / 1000 : null;
+
+                    // Simple colour coding based on total time.
+                    $row_class = 'wppc-row-fast';
+                    if ($total_ms > 3000) {
+                        $row_class = 'wppc-row-slow';
+                    } elseif ($total_ms > 1000) {
+                        $row_class = 'wppc-row-medium';
+                    }
+
+                    echo '<tr class="' . esc_attr($row_class) . '">';
+                    echo '<td>' . esc_html($time) . '</td>';
+
+                    echo '<td>';
+                    if ($post_id > 0) {
+                        $edit_link = get_edit_post_link($post_id);
+                        if ($edit_link) {
+                            echo '<a href="' . esc_url($edit_link) . '">';
+                            echo esc_html('#' . $post_id . ' – ' . $title);
+                            echo '</a>';
+                        } else {
+                            echo esc_html('#' . $post_id . ' – ' . $title);
+                        }
+                    } else {
+                        echo esc_html($title);
+                    }
+                    echo '</td>';
+
+                    echo '<td>' . esc_html(number_format($total_s, 2)) . '</td>';
+                    echo '<td>' . esc_html($before_s !== null ? number_format($before_s, 2) : '') . '</td>';
+                    echo '<td>' . esc_html($hook_s !== null ? number_format($hook_s, 2) : '') . '</td>';
+                    echo '<td>' . esc_html($after_s !== null ? number_format($after_s, 2) : '') . '</td>';
+                    echo '</tr>';
+                }
+
+                echo '</tbody></table>';
             } else {
                 echo '<p>' . esc_html__('No save requests logged yet.', 'wp-performance-checker') . '</p>';
+            }
+
+            // Table with recent admin-ajax requests.
+            echo '<h3>' . esc_html__('Recent admin-ajax requests (background work)', 'wp-performance-checker') . '</h3>';
+            if (!empty($ajax_events)) {
+                echo '<p>' . esc_html__(
+                    'These are recent admin-ajax.php requests (for example SEO analysis, link suggestions, or other background tasks) that run around saves. Times are total seconds per request.',
+                    'wp-performance-checker'
+                ) . '</p>';
+
+                echo '<table class="widefat striped" style="max-width:100%;margin-top:0.5em;">';
+                echo '<thead><tr>';
+                echo '<th>' . esc_html__('Time', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Method', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Ajax action', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Source page', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Request URI', 'wp-performance-checker') . '</th>';
+                echo '<th>' . esc_html__('Total (s)', 'wp-performance-checker') . '</th>';
+                echo '</tr></thead><tbody>';
+
+                foreach ($ajax_events as $event) {
+                    $time        = isset($event['time']) ? (string) $event['time'] : '';
+                    $method      = isset($event['method']) ? (string) $event['method'] : '';
+                    $action      = isset($event['action']) ? (string) $event['action'] : '';
+                    $referer     = isset($event['referer']) ? (string) $event['referer'] : '';
+                    $request_uri = isset($event['request_uri']) ? (string) $event['request_uri'] : '';
+                    $total_s     = isset($event['total_s']) ? (float) $event['total_s'] : 0.0;
+
+                    $row_class = '';
+                    if ($total_s > 3.0) {
+                        $row_class = 'wppc-row-slow';
+                    } elseif ($total_s > 1.0) {
+                        $row_class = 'wppc-row-medium';
+                    } else {
+                        $row_class = 'wppc-row-fast';
+                    }
+
+                    echo '<tr class="' . esc_attr($row_class) . '">';
+                    echo '<td>' . esc_html($time) . '</td>';
+                    echo '<td>' . esc_html($method) . '</td>';
+                    echo '<td>' . esc_html($action !== '' ? $action : '—') . '</td>';
+                    echo '<td>' . esc_html($referer !== '' ? $referer : '—') . '</td>';
+                    echo '<td>' . esc_html($request_uri !== '' ? $request_uri : '—') . '</td>';
+                    echo '<td>' . esc_html(number_format($total_s, 2)) . '</td>';
+                    echo '</tr>';
+                }
+
+                echo '</tbody></table>';
+            } else {
+                echo '<p>' . esc_html__('No admin-ajax requests logged yet.', 'wp-performance-checker') . '</p>';
             }
 
             // Synthetic test still belongs to this tool.
@@ -825,7 +1055,8 @@ class WP_Performance_Checker {
                     'post_status'  => 'draft',
                     'post_type'    => 'post',
                     'post_content' => $base_content,
-                    'post_author'  => $source_post ? $source_post->post_author : get_current_user_id(),
+                    // Always attribute the test post to the currently logged-in user.
+                    'post_author'  => get_current_user_id() ?: 0,
                 ],
                 true
             );
@@ -842,10 +1073,11 @@ class WP_Performance_Checker {
 
             update_option('wp_performance_checker_test_post_id', (int) $post_id, false);
         } else {
-            // Ensure existing test post stays draft and roughly matches the source.
+            // Ensure existing test post stays draft, roughly matches the source, and belongs to the current user.
             $update_args = [
                 'ID'          => (int) $post->ID,
                 'post_status' => 'draft',
+                'post_author'  => get_current_user_id() ?: $post->post_author,
             ];
 
             if ($source_post) {
